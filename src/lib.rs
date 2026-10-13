@@ -490,7 +490,7 @@ impl ClientHandle {
     ) -> Result<(ClickhouseTransport, Block)> {
         let stream = transport.call(Cmd::SendQuery(query, context));
         let (transport, b) = stream.read_block().await?;
-        let dst_block = b.unwrap();
+        let dst_block = b.ok_or(Error::Driver(DriverError::UnexpectedPacket))?;
         Ok((transport, dst_block))
     }
 
@@ -683,6 +683,34 @@ pub(crate) mod test_misc {
             packet.get_buffer()
         }
 
+        fn data_packet(block: &Block) -> Vec<u8> {
+            let mut packet = Encoder::new();
+            packet.uvarint(protocol::SERVER_DATA);
+            packet.string("");
+            block.write(&mut packet, false);
+            packet.get_buffer()
+        }
+
+        async fn acknowledge_insert_chunk(
+            peer: &mut TcpStream,
+            context: &Context,
+            query: &Query,
+            block: Block,
+        ) {
+            let sample = Block::new().column("id", Vec::<u8>::new());
+            respond(
+                peer,
+                Cmd::SendQuery(query.clone(), context.clone()),
+                Some(data_packet(&sample)),
+            )
+            .await;
+            let data = Cmd::Union(
+                Box::new(Cmd::SendData(block, context.clone())),
+                Box::new(Cmd::SendData(Block::default(), context.clone())),
+            );
+            respond(peer, data, Some(end_of_stream())).await;
+        }
+
         #[tokio::test]
         async fn execute_returns_broken_connection_on_premature_eof() {
             let (mut client, mut peer) = client_and_peer().await;
@@ -721,6 +749,95 @@ pub(crate) mod test_misc {
                 result.unwrap();
                 assert!(client.inner.is_some());
             }
+        }
+
+        #[tokio::test]
+        async fn insert_returns_unexpected_packet_without_sample_block() {
+            let (mut client, mut peer) = client_and_peer().await;
+            let block = Block::new().column("id", vec![42_u8]);
+            let query = ClientHandle::make_query("test", &block).unwrap();
+            let command = Cmd::SendQuery(query, client.context.clone());
+            let (result, ()) = timeout(TEST_TIMEOUT, async {
+                tokio::join!(
+                    client.insert("test", &block),
+                    respond(&mut peer, command, Some(end_of_stream()))
+                )
+            })
+            .await
+            .expect("insert did not finish after end-of-stream without a sample block");
+
+            assert!(matches!(
+                result,
+                Err(Error::Driver(DriverError::UnexpectedPacket))
+            ));
+            assert!(client.inner.is_none());
+            assert!(matches!(
+                client.ping().await,
+                Err(Error::Connection(ConnectionError::Broken))
+            ));
+        }
+
+        #[tokio::test]
+        async fn insert_returns_unexpected_packet_without_sample_block_for_later_chunk() {
+            let (mut client, mut peer) = client_and_peer().await;
+            let block = Block::new().column("id", vec![42_u8; INSERT_BLOCK_SIZE + 1]);
+            let first_chunk = block.clone().chunks(INSERT_BLOCK_SIZE).next().unwrap();
+            let query = ClientHandle::make_query("test", &block).unwrap();
+            let context = client.context.clone();
+            let (result, ()) = timeout(TEST_TIMEOUT, async {
+                tokio::join!(client.insert("test", &block), async {
+                    acknowledge_insert_chunk(&mut peer, &context, &query, first_chunk).await;
+                    respond(
+                        &mut peer,
+                        Cmd::SendQuery(query, context),
+                        Some(end_of_stream()),
+                    )
+                    .await;
+                })
+            })
+            .await
+            .expect("insert did not finish after a later chunk's missing sample block");
+
+            assert!(matches!(
+                result,
+                Err(Error::Driver(DriverError::UnexpectedPacket))
+            ));
+            assert!(client.inner.is_none());
+            assert!(matches!(
+                client.ping().await,
+                Err(Error::Connection(ConnectionError::Broken))
+            ));
+        }
+
+        #[tokio::test]
+        async fn insert_preserves_connection_after_multiple_chunks() {
+            let (mut client, mut peer) = client_and_peer().await;
+            let block = Block::new().column("id", vec![42_u8; INSERT_BLOCK_SIZE + 1]);
+            let chunks = block.clone().chunks(INSERT_BLOCK_SIZE);
+            let query = ClientHandle::make_query("test", &block).unwrap();
+            let context = client.context.clone();
+            let (result, ()) = timeout(TEST_TIMEOUT, async {
+                tokio::join!(client.insert("test", &block), async {
+                    for chunk in chunks {
+                        acknowledge_insert_chunk(&mut peer, &context, &query, chunk).await;
+                    }
+                })
+            })
+            .await
+            .expect("insert did not finish after acknowledging every chunk");
+
+            result.unwrap();
+            assert!(client.inner.is_some());
+            let command = query_command(&client);
+            let (result, ()) = timeout(TEST_TIMEOUT, async {
+                tokio::join!(
+                    client.execute(QUERY),
+                    respond(&mut peer, command, Some(end_of_stream()))
+                )
+            })
+            .await
+            .expect("connection was not reusable after insert");
+            result.unwrap();
         }
 
         #[tokio::test]
@@ -765,16 +882,11 @@ pub(crate) mod test_misc {
             let (mut client, mut peer) = client_and_peer().await;
             let command = query_command(&client);
             let stream = client.get_inner().unwrap().call(query_command(&client));
-            let mut packet = Encoder::new();
-            packet.uvarint(protocol::SERVER_DATA);
-            packet.string("");
-            Block::new()
-                .column("id", vec![42_u8])
-                .write(&mut packet, false);
+            let packet = data_packet(&Block::new().column("id", vec![42_u8]));
             let (result, ()) = timeout(TEST_TIMEOUT, async {
                 tokio::join!(
                     stream.read_block(),
-                    respond(&mut peer, command, Some(packet.get_buffer()))
+                    respond(&mut peer, command, Some(packet))
                 )
             })
             .await
